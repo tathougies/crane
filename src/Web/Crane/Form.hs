@@ -40,7 +40,7 @@ multipartFormType, urlEncodedFormType :: BS.ByteString
 multipartFormType = "multipart/form-data"
 urlEncodedFormType = "application/x-www-form-urlencoded"
 
-form :: (CraneApp app, ResultsIn o (CraneHandler app)) => Text -> Form v (CraneMonad app) a -> GenCraneMiddleware app ((View v, Maybe a) -> o) o
+form :: (CraneApp app, ResultsIn o (CraneHandler app master)) => Text -> Form v (CraneMonad app master) a -> GenCraneMiddleware app master ((View v, Maybe a) -> o) o
 form formName digestiveForm mkHandler =
      do -- Depending on the method type, we should check that all required keys/etc do indeed exist
         -- This will ignore any multipart encoded forms (since they may contain file uploads). If you want to use forms with file uploads,

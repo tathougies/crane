@@ -27,21 +27,23 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.Map as M
+import qualified Data.Text as T
 import qualified Data.UUID as UUID
 
 import System.Random
 
 import Web.Cookie (SetCookie(..), renderSetCookie)
 
-injectSessionIntoMiddleware :: CraneAddSession a => ((ByteString, IO (SessionFor a)) -> GenCraneMiddleware a i o) -> GenCraneMiddleware a i o
-injectSessionIntoMiddleware f = f (cookieName (deduceProxy f), initialSession)
-    where deduceProxy :: CraneAddSession a => ((ByteString, IO (SessionFor a)) -> GenCraneMiddleware a i o) -> Proxy a
-          deduceProxy _ = Proxy
+type SessionDict = M.Map T.Text JSON.Value
 
-session :: (CraneApp a, CraneAddSession a, ToJSON (SessionFor a), FromJSON (SessionFor a), ResultsIn b (CraneHandler a)) => GenCraneMiddleware a (SessionFor a -> b) b
+injectSessionIntoMiddleware :: CraneAddSession a => ((ByteString, IO (SessionFor a)) -> GenCraneMiddleware a master i o) -> GenCraneMiddleware a master i o
+injectSessionIntoMiddleware f = f (cookieName (deduceAppProxy f), initialSession)
+    where deduceAppProxy :: CraneAddSession a => ((ByteString, IO (SessionFor a)) -> GenCraneMiddleware a master i o) -> Proxy a
+          deduceAppProxy _ = Proxy
+
+session :: (CraneApp a, CraneAddSession a, ToJSON (SessionFor a), FromJSON (SessionFor a), ResultsIn b (CraneHandler a master)) => GenCraneMiddleware a master (SessionFor a -> b) b
 session = injectSessionIntoMiddleware $ \(cookieName, initialSession) mkHandler ->
-          do sessBackend <- asks (sessionBackend . rpsApp . fst)
-             sessionId <- cookie cookieName
+          do sessionId <- cookie cookieName
 
              tell (completeStoreSession cookieName sessionId)
 
@@ -50,19 +52,26 @@ session = injectSessionIntoMiddleware $ \(cookieName, initialSession) mkHandler 
                        --            Just sessId -> return sessId
              handler <- mkHandler
              return (monadifyArg handler $ do
+                       sessBackend <- asks (csSessionBackend . crSite)
+                       app <- asks crApp
                        case sessionId of
                          Nothing -> liftIO initialSession
                          Just sessionId ->
                              do contentOrError <- liftIO (runErrorT (csbFetchSession sessBackend sessionId))
                                 case contentOrError of
                                   Right (Just sessionContents, storeSession) ->
-                                    case JSON.decode (LBS.fromChunks [sessionContents]) of
-                                      Just sessionContents -> return sessionContents
-                                      Nothing -> throwError CorruptSessionContents
+                                    case JSON.decode (LBS.fromChunks [sessionContents]) :: Maybe SessionDict of
+                                      Just sessionContents -> -- Lookup the key for this app in the session contents dictionary and try to parse it into the right format
+                                          case M.lookup (sessionAppKey app) sessionContents of
+                                            Nothing -> liftIO initialSession
+                                            Just sessionContents ->
+                                                case JSON.fromJSON sessionContents of
+                                                  JSON.Error err -> throwError CorruptSessionContents
+                                                  JSON.Success x -> return x
                                   Right (Nothing, storeSession) -> liftIO initialSession
                                   Left err -> throwError (CouldNotFetchSession err))
 
-completeStoreSession :: CraneAddSession app => ByteString -> Maybe ByteString -> AfterResponseActions app
+completeStoreSession :: CraneAddSession app => ByteString -> Maybe ByteString -> AfterResponseActions app master
 completeStoreSession cookieName sessionId = go
     where go = AfterResponseActions $
                \response ->
@@ -79,9 +88,9 @@ completeStoreSession cookieName sessionId = go
 
                       -- Now store the session in the backend...
                       app <- asks crApp
-                      sessBackend <- asks (sessionBackend . crApp)
+                      sessBackend <- asks (csSessionBackend . crSite)
                       let storedSessions = crSessions response
-                          ourSession = M.lookup (typeOf app) storedSessions
+                          ourSession = M.lookup (sessionAppKey app) storedSessions
 
                       case ourSession of
                         Nothing -> return response' -- If we have no new session to store, then just return the response to set the cookie
@@ -89,22 +98,29 @@ completeStoreSession cookieName sessionId = go
                             do contentOrError <- liftIO (runErrorT (csbFetchSession sessBackend sessionId))
                                case contentOrError of
                                  Left err -> throwError (CouldNotStoreSession err)
-                                 Right (_, storeSession) ->
-                                     do storeSessionResult <- liftIO (runErrorT (storeSession ourSessionContents))
+                                 Right (currentSessionContentsJSON, storeSession) ->
+                                     do currentSessionContents <- case currentSessionContentsJSON of
+                                                                    Just currentSessionContentsJSON ->
+                                                                      case JSON.decode (LBS.fromChunks [currentSessionContentsJSON]) :: Maybe SessionDict of
+                                                                        Just currentSessionContents -> return currentSessionContents
+                                                                        Nothing -> throwError CorruptSessionContents
+                                                                    Nothing -> return M.empty
+                                        let newSessionContents' = M.insert (sessionAppKey app) ourSessionContents currentSessionContents
+                                            newSessionContents'JSON = BS.concat . LBS.toChunks . JSON.encode $ newSessionContents'
+                                        storeSessionResult <- liftIO (runErrorT (storeSession newSessionContents'JSON))
                                         case storeSessionResult of
                                           Left err -> throwError (CouldNotStoreSession err)
                                           Right () -> return response'
 
-storeSession :: CraneAddSession a => SessionFor a -> CraneResponseBuilder a
+          deduceMasterProxy :: AfterResponseActions app master -> Proxy master
+          deduceMasterProxy _ = Proxy
+
+          masterProxy = deduceMasterProxy go
+
+storeSession :: CraneAddSession a => SessionFor a -> CraneResponseBuilder a master
 storeSession session = go
     where go = CraneResponseBuilder $ \req res ->
-               res { crSessions = M.insert appTypeRep (BS.concat . LBS.toChunks . JSON.encode $ session) (crSessions res) }
-
-          -- Haskell magic...
-          appProxy :: CraneResponseBuilder a -> a
-          appProxy _ = undefined
-
-          appTypeRep = typeOf (appProxy go)
+               res { crSessions = M.insert (sessionAppKey (crApp req)) (JSON.toJSON session) (crSessions res) }
 
 -- * Session backends
 

@@ -15,7 +15,7 @@ import qualified Data.CaseInsensitive as CI
 import Network.Wai
 import Network.HTTP.Types
 
-checkMethod :: Method -> ConstructHandler app (RoutesFor app -> CraneHandler app) -> ConstructHandler app (CraneHandler app)
+checkMethod :: Method -> ConstructHandler app master (RoutesFor app -> CraneHandler app master) -> ConstructHandler app master (CraneHandler app master)
 checkMethod expMethod routeAction =
     do method <- asks (requestMethod . rpsWaiRequest . fst)
 
@@ -28,10 +28,10 @@ post = checkMethod methodPost
 
 -- * Cookies
 
-cookie :: ByteString -> ConstructHandler app (Maybe ByteString)
+cookie :: ByteString -> ConstructHandler app master (Maybe ByteString)
 cookie cookieName = do cookies <- asks (rpsParsedCookies . fst)
                        return (lookup cookieName cookies)
 
-reqHeader :: CI.CI ByteString -> ConstructHandler app (Maybe ByteString)
+reqHeader :: CI.CI ByteString -> ConstructHandler app master (Maybe ByteString)
 reqHeader name = do headers <- asks (requestHeaders . rpsWaiRequest . fst)
                     return (lookup name headers)

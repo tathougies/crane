@@ -14,7 +14,7 @@ monadifyArg f mkA = makeApplier $ \applyRemaining ->
 class ResultsIn i o | i -> o where
     makeApplier :: ((i -> o) -> o) -> i
 
-instance ResultsIn (CraneHandler a) (CraneHandler a) where
+instance ResultsIn (CraneHandler a master) (CraneHandler a master) where
     makeApplier context = context id
 
 instance ResultsIn b o => ResultsIn (a -> b) o where
@@ -24,11 +24,13 @@ instance ResultsIn b o => ResultsIn (a -> b) o where
 
 -- * CraneMonad goodies
 
-mapCraneHandler :: (master -> sub) -> CraneHandler sub -> CraneHandler master
-mapCraneHandler subsiteFromMaster subAction =
+mapCraneHandler :: (master -> sub) -> (RoutesFor sub -> RoutesFor master) -> CraneHandler sub supermaster -> CraneHandler master supermaster
+mapCraneHandler subsiteFromMaster subRouteToMaster subAction =
     do subApp <- asks (subsiteFromMaster . crApp)
+       masterRouteToSuperMaster <- asks crAppRouteToMaster
 
-       let lowerRequestToSubApp request = request { crApp = subApp }
+       let lowerRequestToSubApp request = request { crApp = subApp
+                                                  , crAppRouteToMaster = masterRouteToSuperMaster . subRouteToMaster }
 
        CraneResponseBuilder subResponseBuilder <- mapErrorT (withReaderT lowerRequestToSubApp) subAction
 
@@ -38,10 +40,13 @@ mapCraneHandler subsiteFromMaster subAction =
                                        in subResponseBuilder subRequest response
        return masterResponseBuilder
 
-mapAfterResponseActions :: (master -> sub) -> AfterResponseActions sub -> AfterResponseActions master
-mapAfterResponseActions subsiteFromMaster (AfterResponseActions subActions) =
+mapAfterResponseActions :: (master -> sub) -> (RoutesFor sub -> RoutesFor master) -> AfterResponseActions sub supermaster -> AfterResponseActions master supermaster
+mapAfterResponseActions subsiteFromMaster subRouteToMaster (AfterResponseActions subActions) =
     AfterResponseActions $ \response ->
         do subApp <- asks (subsiteFromMaster . crApp)
-           let lowerRequestToSubApp request = request { crApp = subApp }
+           masterRouteToSuperMaster <- asks crAppRouteToMaster
+
+           let lowerRequestToSubApp request = request { crApp = subApp
+                                                      , crAppRouteToMaster = masterRouteToSuperMaster . subRouteToMaster}
 
            mapErrorT (withReaderT lowerRequestToSubApp) (subActions response)

@@ -1,8 +1,18 @@
-{-# LANGUAGE OverloadedStrings #-}
-module Web.Crane.Wai where
+{-# LANGUAGE OverloadedStrings, FlexibleContexts #-}
+module Web.Crane.Wai
+    ( W.HostPreference(..)
+    , CraneSettings (..)
+
+    , craneRunDefault
+    , craneRun
+
+    , defaultSettings
+
+    , waiAppForApp) where
 
 import Web.Crane.Types
 import Web.Crane.Routes
+import Web.Crane.Site
 
 import Control.Monad.Reader
 import Control.Monad.Error
@@ -13,10 +23,30 @@ import Data.String
 import Data.Monoid
 
 import Network.Wai
+import qualified Network.Wai.Handler.Warp as W
+
 import Network.HTTP.Types.Status
 
-craneWaiApp :: CraneApp a => a -> Application
-craneWaiApp app req respond =
+data CraneSettings = CraneSettings
+                   { craneServerPort :: W.Port
+                   , craneServerHost :: W.HostPreference }
+
+defaultSettings :: CraneSettings
+defaultSettings = CraneSettings 8000 "*"
+
+craneRunDefault :: CraneApp a => a -> IO ()
+craneRunDefault app = craneRun defaultSettings (defaultSiteSpec app)
+
+craneRun :: CraneApp a => CraneSettings -> CraneSiteSpec a -> IO ()
+craneRun settings spec = do
+  (site, app) <- mkSite spec
+
+  let warpSettings = W.setPort (craneServerPort settings) . W.setHost (craneServerHost settings) $ W.defaultSettings
+
+  W.runSettings warpSettings (waiAppForApp site app)
+
+waiAppForApp :: CraneApp a => CraneSite -> a -> Application
+waiAppForApp site app req respond =
     case lookupActionForRoute app req of
       Left (CouldNotMatchComponent _ _) -> notFound
       Left (UnableToInterpret _) -> notFound
@@ -24,7 +54,7 @@ craneWaiApp app req respond =
       Left Empty -> notFound
       Left NoHandlerForMethod -> respond (responseLBS badRequest400 [] "Invalid method")
       Right (action, AfterResponseActions afterResponse) ->
-          do let craneRequest = CraneRequest req app
+          do let craneRequest = CraneRequest site req app app id
 
              craneResponseBuilder <- runReaderT (runErrorT action) craneRequest
              case craneResponseBuilder of

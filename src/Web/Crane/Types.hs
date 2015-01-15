@@ -1,9 +1,9 @@
-{-# LANGUAGE OverloadedStrings, TypeFamilies, GeneralizedNewtypeDeriving, MultiParamTypeClasses, FunctionalDependencies, UndecidableInstances, TypeSynonymInstances, FlexibleInstances, FlexibleContexts, DefaultSignatures, TypeOperators, GADTs #-}
+{-# LANGUAGE OverloadedStrings, TypeFamilies, GeneralizedNewtypeDeriving, MultiParamTypeClasses, FunctionalDependencies, UndecidableInstances, TypeSynonymInstances, FlexibleInstances, FlexibleContexts, DefaultSignatures, TypeOperators, GADTs, StandaloneDeriving, DeriveDataTypeable #-}
 module Web.Crane.Types where
 
 import Blaze.ByteString.Builder
 
-import Prelude hiding (id)
+import Prelude hiding (id, (.))
 
 import Control.Applicative
 import Control.Arrow
@@ -25,8 +25,11 @@ import Data.ByteString
 import Data.Typeable
 import qualified Data.CaseInsensitive as CI
 import qualified Data.Map as M
+import qualified Data.Aeson as JSON
 
 import GHC.Generics
+
+import Unsafe.Coerce
 
 import Network.Wai as Wai
 import Network.HTTP.Types
@@ -34,14 +37,16 @@ import Network.HTTP.Types
 -- * CraneMonad
 
 data CraneRequest app master = CraneRequest
-                             { crWaiRequest :: Request
+                             { crSite :: CraneSite
+                             , crWaiRequest :: Request
                              , crApp :: app
+                             , crMaster :: master
                              , crAppRouteToMaster :: RoutesFor app -> RoutesFor master}
 data CraneResponse = CraneResponse
                      { crHeaders :: ResponseHeaders
                      , crStatusCode :: Status
                      , crResponseBody :: CraneResponseBody
-                     , crSessions :: M.Map TypeRep ByteString }
+                     , crSessions :: M.Map Text JSON.Value }
 data CraneResponseBody = CraneResponseBodyBuilder Builder
 newtype CraneResponseBuilder app master = CraneResponseBuilder { runResponseBuilder :: CraneRequest app master -> CraneResponse -> CraneResponse }
 
@@ -55,8 +60,19 @@ instance Error CraneHandlerError
 
 type CraneHandler app master = CraneMonad app master (CraneResponseBuilder app master)
 type CraneMonad app master = ErrorT CraneHandlerError (ReaderT (CraneRequest app master) IO)
+newtype PathParser pc app master i o = PathParser { runPathParser :: pc app master i o }
 
 emptyResponse = CraneResponse [] ok200 (CraneResponseBodyBuilder mempty)
+
+getApp :: CraneMonad app master app
+getApp = getApp' id
+getMaster :: CraneMonad app master master
+getMaster = getMaster' id
+
+getApp' :: (app -> a) -> CraneMonad app master a
+getApp' f = asks (f . crApp)
+getMaster' :: (master -> a) -> CraneMonad app master a
+getMaster' f = asks (f . crMaster)
 
 -- * Routes
 
@@ -65,7 +81,7 @@ data RouteParseState app master = RouteParseState
                                 , rpsWaiRequest :: Wai.Request
                                 , rpsParsedCookies :: [(ByteString, ByteString)]
                                 , rpsApp :: app
-                                , rpsAppRouteToMaster :: RoutesFor app -> RoutesFor master }
+                                , rpsMaster :: master }
 
 newtype AfterResponseActions app master = AfterResponseActions { runAfterResponseActions :: CraneResponse -> CraneMonad app master CraneResponse }
 
@@ -86,48 +102,54 @@ data RouteParseError = CouldNotMatchComponent Text Text
                        deriving (Show, Read, Eq, Ord)
 instance Error RouteParseError
 
-data Var a = Var
-           deriving (Show)
-
 class ToPathComponent a where
     toPathComponent :: a -> Text
 
 class FromPathComponent a where
     fromPathComponent :: Text -> Maybe a
 
-newtype ConstructHandler app master a = ConstructHandler { runConstructHandler :: WriterT (AfterResponseActions app master) (ErrorT RouteParseError (Reader (RouteParseState app master, RoutesFor app master))) a }
-    deriving (Monad, Applicative, Functor, MonadError RouteParseError, MonadReader (RouteParseState app, RoutesFor app), MonadWriter (AfterResponseActions app))
-newtype ActionDispatch app master a = ActionDispatch { runActionDispatch :: ErrorT RouteParseError (Reader (RouteParseState app)) a }
-    deriving (Monad, Applicative, Functor, MonadError RouteParseError, MonadReader (RouteParseState app))
-newtype RouteDispatch app master i a = RouteDispatch { runRouteDispatch :: (i, RouteParseState app) -> Either RouteParseError (a, RouteParseState app) }
+newtype ConstructHandler app master a = ConstructHandler { runConstructHandler :: WriterT (AfterResponseActions app master) (ErrorT RouteParseError (Reader (RouteParseState app master, RoutesFor app))) a }
+    deriving (Monad, Applicative, Functor, MonadError RouteParseError, MonadReader (RouteParseState app master, RoutesFor app), MonadWriter (AfterResponseActions app master))
+newtype ActionDispatch app master a = ActionDispatch { runActionDispatch :: ErrorT RouteParseError (Reader (RouteParseState app master)) a }
+    deriving (Monad, Applicative, Functor, MonadError RouteParseError, MonadReader (RouteParseState app master))
+newtype RouteDispatch app master i a = RouteDispatch { runRouteDispatch :: (i, RouteParseState app master) -> Either RouteParseError (a, RouteParseState app master) }
 
 data GenericPathComponent where
-    GenericPathComponent :: ToPathComponent a => a -> GenericPathComponent
+    GenericPathComponent :: (Typeable a, ToPathComponent a) => a -> GenericPathComponent
 
 class PathContext pc where
-    popPathComponent :: (Arrow (pc app), ArrowChoice (pc app)) => Either Text (GenericPathComponent -> Text) -> pc app i (Maybe Text)
-    routeParseError  :: (Arrow (pc app), ArrowChoice (pc app)) => pc app RouteParseError b
-
-class PathComponent c input output | c -> input, c input -> output where
-    (*/) :: (PathContext m, Arrow (m app), ArrowChoice (m app)) => m app i input -> c -> m app i output
+    popPathComponent :: (Arrow (pc app master), ArrowChoice (pc app master)) => Either Text (GenericPathComponent -> Text) -> pc app master i (Maybe Text)
+    routeParseError  :: (Arrow (pc app master), ArrowChoice (pc app master)) => pc app master RouteParseError b
 
 class PathContext pc => ActionContext ac pc | ac -> pc where
-    ($|) :: ac app (CraneHandler app, AfterResponseActions app) -> ac app (CraneHandler app, AfterResponseActions app) -> ac app (CraneHandler app, AfterResponseActions app)
-    ($-) :: ac app (RoutesFor app) -> ConstructHandler app (CraneHandler app) -> ac app (CraneHandler app, AfterResponseActions app)
-    path :: (ConEq (RoutesFor app), DeconstructRoute (RoutesFor app), ResultsInRoute a (RoutesFor app)) => a -> pc app a (RoutesFor app) -> ac app (RoutesFor app)
-    mount :: (ConEq (RoutesFor app), DeconstructRoute (RoutesFor app), ResultsInRoute a (RoutesFor app), IsCraneSubsite app sub) => a -> pc app a (RoutesFor sub -> RoutesFor app)  -> ac app (CraneHandler app, AfterResponseActions app)
+    ($|) :: ac app master (CraneHandler app master, AfterResponseActions app master) ->
+            ac app master (CraneHandler app master, AfterResponseActions app master) ->
+            ac app master (CraneHandler app master, AfterResponseActions app master)
 
-class (CraneApp master, CraneApp sub) => IsCraneSubsite master sub where
+    ($-) :: ac app master (RoutesFor app) ->
+            ConstructHandler app master (CraneHandler app master) ->
+            ac app master (CraneHandler app master, AfterResponseActions app master)
+
+    path :: ( CraneApp app, CraneApp master
+            , ResultsInRoute a (RoutesFor app)) =>
+            a ->
+            PathParser pc app master a (RoutesFor app) ->
+            ac app master (RoutesFor app)
+
+    mount :: ( ResultsInRoute a (RoutesFor app)
+             , IsCraneSubsite app sub, CraneApp master) =>
+             a ->
+             PathParser pc app master a (RoutesFor sub -> RoutesFor app) ->
+             ac app master (CraneHandler app master, AfterResponseActions app master)
+
+class (CraneApp app, CraneApp sub) => IsCraneSubsite app sub where
     -- | Subsites can be instantiated multiple times under different routes. The first parameter lets us select
     --   the subsite based on the route under consideration. The function should not be strict in the route
     --   for the subsite, since that will be undefined. The other constructor arguments will be valid
-    subsiteFromMaster :: RoutesFor master -> master -> sub
+    subsiteFromMaster :: RoutesFor app -> app -> sub
 
 infixl 3 $|
 infixr 4 $-
-
-root :: (PathContext pc, Category (pc app)) => pc app a a
-root = id
 
 class ResultsInRoute a r | a -> r where
     getRoute :: a -> r
@@ -187,11 +209,15 @@ instance DeconstructRoute (U1 x) where
 instance DeconstructRoute (p x) => DeconstructRoute (M1 S f p x) where
     deconstructRoute (M1 a) = deconstructRoute a
 
-instance ToPathComponent c => DeconstructRoute (K1 R c x) where
-    deconstructRoute (K1 c) = [GenericPathComponent c]
-
 instance (DeconstructRoute (f x), DeconstructRoute (g x)) => DeconstructRoute ((:*:) f g x) where
     deconstructRoute (f :*: g) = deconstructRoute f ++ deconstructRoute g
+
+instance (ToPathComponent c, Typeable c) => DeconstructRoute (K1 R c x) where
+    deconstructRoute (K1 c) = [GenericPathComponent c]
+
+-- | `RoutesFor a` components are handled in a special way. These only arise when we're using subsites (there's no FromPathComponent instance, so they can't be used with Var)
+instance CraneApp a => ToPathComponent (RoutesFor a) where
+    toPathComponent _ = undefined
 
 -- * Apps
 
@@ -201,7 +227,10 @@ class ( ResultsInRoute (RoutesFor a) (RoutesFor a)
       , Typeable a) => CraneApp a where
     data RoutesFor a  :: *
 
-    routes :: (ActionContext ac pc, Arrow (pc a), ArrowChoice (pc a)) => a -> ac a (CraneHandler a, AfterResponseActions a)
+    routes :: ( CraneApp master
+              , ActionContext ac pc, Arrow (pc a master), ArrowChoice (pc a master)) => a -> ac a master (CraneHandler a master, AfterResponseActions a master)
+
+deriving instance Typeable RoutesFor
 
 class ( CraneApp a
       , FromJSON (SessionFor a)
@@ -209,23 +238,30 @@ class ( CraneApp a
     data SessionFor a :: *
 
     initialSession   :: IO (SessionFor a)
-    sessionBackend :: a -> CraneSessionBackend
+
     cookieName       :: Proxy a -> ByteString
     cookieName      _ = "SESSIONID"
 
-instance CraneApp a => ResultsInRoute (RoutesFor a) (RoutesFor a)
+    sessionAppKey    :: a -> Text
+
+    default sessionAppKey :: Show a => a -> Text
+    sessionAppKey = fromString . show
+
+instance CraneApp a  => ResultsInRoute (RoutesFor a) (RoutesFor a)
 instance (CraneApp a, Generic (RoutesFor a), ConEq (Rep (RoutesFor a) ())) => ConEq (RoutesFor a)
 instance (CraneApp a, Generic (RoutesFor a), DeconstructRoute (Rep (RoutesFor a) ())) => DeconstructRoute (RoutesFor a)
 instance (CraneAddSession a, Generic (SessionFor a),
           GFromJSON (Rep (SessionFor a))) => FromJSON (SessionFor a)
 instance (CraneAddSession a, Generic (SessionFor a),
           GToJSON (Rep (SessionFor a))) => ToJSON (SessionFor a)
+-- instance CraneApp a master => IsCraneSubsite a a master where -- All sites are subsites of themselves
+--     subsiteFromMaster _ a = a
 
 -- ** Middleware
 
-type GenCraneMiddleware app i o = ConstructHandler app i -> ConstructHandler app o
+type GenCraneMiddleware app master i o = ConstructHandler app master i -> ConstructHandler app master o
 
-(<:>) :: CraneApp a => ConstructHandler a i -> GenCraneMiddleware a i o -> ConstructHandler a o
+(<:>) :: CraneApp a => ConstructHandler a master i -> GenCraneMiddleware a master i o -> ConstructHandler a master o
 handler <:> middleware = middleware handler
 
 infixl 4 <:>
@@ -249,3 +285,12 @@ cookieHeaderName = "Cookie"
 
 contentTypeHeaderName :: CI.CI ByteString
 contentTypeHeaderName = "Content-type"
+
+-- * Sites
+
+data CraneSiteSpec a = CraneSiteSpec
+                     { mkSessionBackend :: IO CraneSessionBackend
+                     , rootApplication  :: a }
+
+data CraneSite = CraneSite
+               { csSessionBackend :: CraneSessionBackend }

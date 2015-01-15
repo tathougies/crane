@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings, TypeSynonymInstances, FlexibleInstances, MultiParamTypeClasses, UndecidableInstances, GeneralizedNewtypeDeriving, RankNTypes, DoAndIfThenElse, GADTs, KindSignatures, FlexibleContexts, TupleSections #-}
+{-# LANGUAGE OverloadedStrings, TypeSynonymInstances, FlexibleInstances, MultiParamTypeClasses, UndecidableInstances, GeneralizedNewtypeDeriving, RankNTypes, DoAndIfThenElse, GADTs, KindSignatures, FlexibleContexts, TupleSections, ScopedTypeVariables #-}
 module Web.Crane.Routes where
 
 import Web.Crane.Types
@@ -18,8 +18,11 @@ import Control.Arrow
 import Data.String
 import Data.Maybe
 import Data.Proxy
+import Data.Typeable
 import qualified Data.CaseInsensitive as CI
 import qualified Data.Text as T
+
+import GHC.Generics
 
 import Network.Wai
 
@@ -29,21 +32,23 @@ import Web.Cookie (parseCookies)
 
 -- * Path Components
 
-data ReverseState app = ReverseState
-                    { rsRoute :: (RoutesFor app)
-                    , rsDone  :: ExitMonadFunction (ReverseContextM app) (Maybe T.Text) }
+data ReverseState app master = ReverseState
+                             { rsRoute :: RoutesFor app
+                             , rsApp   :: app
+                             , rsMaster :: master
+                             , rsDone  :: ExitMonadFunction (ReverseContextM app master) (Maybe T.Text) }
 
 type ReversePathState = [GenericPathComponent]
 
 data ExitMonadFunction m a where
     ExitMonadFunction :: (a -> m r) -> ExitMonadFunction m a
 
-type ReverseContextM app = ReaderT (ReverseState app) (Cont (Maybe T.Text))
+type ReverseContextM app master = ReaderT (ReverseState app master) (Cont (Maybe T.Text))
 
-newtype ReverseContext app a = ReverseContext { runReverseContext :: ReverseContextM app a }
-    deriving (MonadReader (ReverseState app), MonadCont, Monad, Applicative, Functor)
+newtype ReverseContext app master a = ReverseContext { runReverseContext :: ReverseContextM app master a }
+    deriving (MonadReader (ReverseState app master), MonadCont, Monad, Applicative, Functor)
 
-newtype ReversePathArrow app i a = ReversePathArrow { runReversePath :: (T.Text, ReversePathState) -> (T.Text, ReversePathState) }
+newtype ReversePathArrow app master i a = ReversePathArrow { runReversePath :: (T.Text, ReversePathState) -> (T.Text, ReversePathState) }
 
 instance ToPathComponent GenericPathComponent where
     toPathComponent (GenericPathComponent x) = toPathComponent x
@@ -62,7 +67,7 @@ instance ActionContext ActionDispatch RouteDispatch where
 
     path pathConstructor parsePath = ActionDispatch $
                                      do state <- ask
-                                        case runRouteDispatch parsePath (pathConstructor, state) of
+                                        case runRouteDispatch (runPathParser parsePath) (pathConstructor, state) of
                                           Left err -> throwError err
                                           Right (x, state') -> case pathComponents state' of
                                                                  []   -> return x
@@ -70,12 +75,12 @@ instance ActionContext ActionDispatch RouteDispatch where
                                                                  _    -> throwError NoActionForRoute
     mount pathConstructor parsePath = ActionDispatch $
                                       do state <- ask
-                                         case runRouteDispatch parsePath (pathConstructor, state) of
+                                         case runRouteDispatch (runPathParser parsePath) (pathConstructor, state) of
                                            Left err -> throwError err
 
                                            -- If this succeeds, then we need to parse the remaining components using the subsite's route parser
                                            Right (x, state') ->
-                                               do let subsite = subsiteFromMaster' x masterRoute (rpsApp state)
+                                               do let subsite = subsiteFromMaster masterRoute (rpsApp state) -- masterRoute (rpsApp state)
                                                       subsiteRps = state' { rpsApp = subsite
                                                                           , pathComponents = pathComponents state' }
 
@@ -84,34 +89,36 @@ instance ActionContext ActionDispatch RouteDispatch where
 
                                                       subsiteParseResult = runReader (runErrorT (runActionDispatch dispatch)) subsiteRps
 
-                                                      -- Force the type system into getting the right subsite type
-                                                      subsiteFromMaster' :: IsCraneSubsite app sub => (RoutesFor sub -> RoutesFor app) -> RoutesFor app -> app -> sub
-                                                      subsiteFromMaster' _ = subsiteFromMaster
+                                                      -- -- Force the type system into getting the right subsite type
+                                                      -- subsiteFromMaster' :: RouteDispatch app master a (RoutesFor sub -> RoutesFor app) -> sub
+                                                      -- subsiteFromMaster' _ = subsiteFromMaster (proxyFor (rpsMaster state)) masterRoute (rpsApp state)
 
                                                   case subsiteParseResult of
                                                     Left err -> throwError err
                                                     Right (subHandler, subAfterResponseActions) ->
-                                                        let masterHandler = mapCraneHandler (subsiteFromMaster masterRoute) subHandler
-                                                            masterAfterResponseActions = mapAfterResponseActions (subsiteFromMaster masterRoute) subAfterResponseActions
+                                                        let masterHandler = mapCraneHandler (subsiteFromMaster masterRoute) x subHandler
+                                                            masterAfterResponseActions = mapAfterResponseActions (subsiteFromMaster masterRoute) x subAfterResponseActions
                                                         in return (masterHandler, masterAfterResponseActions)
 
-(*-) :: ConstructHandler app (CraneHandler app) -> ConstructHandler app (CraneHandler app) -> ConstructHandler app (CraneHandler app)
+(*-) :: ConstructHandler app master (CraneHandler app master) ->
+        ConstructHandler app master (CraneHandler app master) ->
+        ConstructHandler app master (CraneHandler app master)
 ConstructHandler a *- ConstructHandler b = ConstructHandler (catchError a (const b))
 infixl 5 *-
 
-instance Category (RouteDispatch app) where
+instance Category (RouteDispatch app master) where
     id = RouteDispatch Right
     RouteDispatch a . RouteDispatch b = RouteDispatch $ \(i, state) -> case b (i, state) of
                                                                          Left err -> Left err
                                                                          Right (i', state') -> a (i', state')
 
-instance Arrow (RouteDispatch app) where
+instance Arrow (RouteDispatch app master) where
     arr f = RouteDispatch $ \(i, state) -> Right (f i, state)
     first (RouteDispatch f) = RouteDispatch $ \((b, d), state) -> case f (b, state) of
                                                                     Left err -> Left err
                                                                     Right (b', state') -> Right ((b', d), state')
 
-instance ArrowChoice (RouteDispatch app) where
+instance ArrowChoice (RouteDispatch app master) where
     left (RouteDispatch f) =
         RouteDispatch $ \(i, state) ->
             case i of
@@ -120,32 +127,48 @@ instance ArrowChoice (RouteDispatch app) where
                            Right (x', state') -> Right (Left x', state')
               Right x -> Right (Right x, state)
 
-instance PathComponent T.Text a a where
-    a */ x = a >>>
-             (popPathComponent (Left x) &&& id) >>>
-             arr (\(component, input) ->
-                      case component of
-                        Just c  -> if c == x then Right input else Left (CouldNotMatchComponent x c)
-                        Nothing -> Left (CouldNotMatchComponent x "")) >>>
-             (routeParseError ||| id)
 
-instance (FromPathComponent v, ToPathComponent v) => PathComponent (Var v) (v -> b) b where
-    a */ Var  = a >>> (parseComponent &&& id) >>> -- We need to do a >>> (parseComponent &&& id) so that a gets to parse first. Otherwise, parseComponent and a both get the same thing
-                arr (\(parsedArg, f) -> f parsedArg)
-        where parseComponent = popPathComponent (Right toPathComponent) >>>
-                               arr (\c -> case fromPathComponent =<< c of
-                                            Just x -> Right x
-                                            _      -> Left (UnableToInterpret (show c))) >>>
-                               (routeParseError ||| id)
+root :: (PathContext pc, Category (pc app master)) => PathParser pc app master a a
+root = PathParser id
 
-lookupActionForRoute :: CraneApp app => app -> Request -> Either RouteParseError (CraneHandler app, AfterResponseActions app)
+txt :: ( PathContext pc, Category (pc app master)
+       , Arrow (pc app master), ArrowChoice (pc app master) ) =>
+       T.Text -> PathParser pc app master a a
+txt x = PathParser ((popPathComponent (Left x) &&& id) >>>
+                    arr (\(component, input) ->
+                             case component of
+                               Just c  -> if c == x then Right input else Left (CouldNotMatchComponent x c)
+                               Nothing -> Left (CouldNotMatchComponent x "")) >>>
+                    (routeParseError ||| id))
+
+var :: ( PathContext pc, Category (pc app master)
+       , Arrow (pc app master), ArrowChoice (pc app master)
+       , FromPathComponent a, ToPathComponent a ) =>
+       PathParser pc app master (a -> b) b
+var = PathParser ((parseComponent &&& id) >>> -- We need to do a >>> (parseComponent &&& id) so that a gets to parse first. Otherwise, parseComponent and a both get the same thing
+                  arr (\(parsedArg, f) -> f parsedArg))
+    where parseComponent = popPathComponent (Right toPathComponent) >>>
+                           arr (\c -> case fromPathComponent =<< c of
+                                        Just x -> Right x
+                                        _      -> Left (UnableToInterpret (show c))) >>>
+                           (routeParseError ||| id)
+
+(*/) :: Category (pc app master) => PathParser pc app master a b -> PathParser pc app master b c -> PathParser pc app master a c
+PathParser a */ PathParser b = PathParser (a >>> b)
+infixl 4 */
+
+instance (PathContext pc, Category (pc app master), Arrow (pc app master), ArrowChoice (pc app master)) => IsString (PathParser pc app master a a) where
+    fromString x = txt (T.pack x)
+
+lookupActionForRoute :: CraneApp app => app -> Request -> Either RouteParseError (CraneHandler app app, AfterResponseActions app app)
 lookupActionForRoute app req =
     let routeParseState = RouteParseState { pathComponents = pathInfo req
                                           , rpsWaiRequest = req
                                           , rpsParsedCookies = case cookieHeader of
                                                                  Just cookieHeader -> parseCookies cookieHeader
                                                                  Nothing -> []
-                                          , rpsApp = app }
+                                          , rpsApp = app
+                                          , rpsMaster = app}
 
         cookieHeader = lookup cookieHeaderName (requestHeaders req)
 
@@ -154,21 +177,21 @@ lookupActionForRoute app req =
 
 -- * URI Reversal
 
-finish :: Maybe T.Text -> ReverseContextM app a
+finish :: Maybe T.Text -> ReverseContextM app master a
 finish result = do st <- ask
                    case st of
                      -- XXX unsafeCoerce...
                      ReverseState { rsDone = ExitMonadFunction finish' } -> (unsafeCoerce finish') result
 
-instance Category (ReversePathArrow app) where
+instance Category (ReversePathArrow app master) where
     id = ReversePathArrow id
     ReversePathArrow a . ReversePathArrow b = ReversePathArrow (a . b)
 
-instance Arrow (ReversePathArrow app) where
+instance Arrow (ReversePathArrow app master) where
     arr f = ReversePathArrow id
     first (ReversePathArrow f) = ReversePathArrow f
 
-instance ArrowChoice (ReversePathArrow app) where
+instance ArrowChoice (ReversePathArrow app master) where
     left (ReversePathArrow f) = ReversePathArrow f
 
 instance PathContext ReversePathArrow where
@@ -194,21 +217,49 @@ instance ActionContext ReverseContext ReversePathArrow where
                                do let route = getRoute routeCon
                                   expRoute <- asks rsRoute
                                   if route @== expRoute
-                                  then finish (Just (fst (runReversePath parseRoute ("", deconstructRoute expRoute))))
+                                  then finish (Just (fst (runReversePath (runPathParser parseRoute) ("", deconstructRoute expRoute))))
                                   else finish Nothing
+    mount routeCon parseRoute = ReverseContext $
+                                do let route = getRoute routeCon
+                                   expRoute <- asks rsRoute
+                                   app      <- asks rsApp
+                                   master   <- asks rsMaster
+                                   if route @== expRoute
+                                   then do let (masterPrefix, remainingComponents) = runReversePath (runPathParser parseRoute) ("", deconstructRoute expRoute)
 
-reversedURI :: (ConEq (RoutesFor app), DeconstructRoute (RoutesFor app)) => ReverseContext app a -> RoutesFor app -> Maybe T.Text
-reversedURI routes r = runCont (runReaderT go (ReverseState r undefined)) id
+                                               subApp' :: IsCraneSubsite app sub => PathParser ReversePathArrow app master a (RoutesFor sub -> RoutesFor app) -> RoutesFor app -> app -> sub
+                                               subApp' _ = subsiteFromMaster
+
+                                               subApp = subApp' parseRoute expRoute app
+
+                                               subAppRoutes = routes subApp
+                                           case remainingComponents of
+                                             [GenericPathComponent c] ->
+                                                 case cast c of
+                                                   Nothing -> finish Nothing
+                                                   Just subRoute -> case reversedURI subAppRoutes subApp subRoute of
+                                                                      Nothing -> finish Nothing
+                                                                      Just subRoute -> finish (Just $ masterPrefix `T.append` subRoute)
+                                             _ -> finish Nothing
+                                   else finish Nothing
+
+reversedURI :: (ConEq (RoutesFor app), DeconstructRoute (RoutesFor app)) => ReverseContext app app a -> app -> RoutesFor app -> Maybe T.Text
+reversedURI routes app r = runCont (runReaderT go (ReverseState r app app undefined)) id
     where go = callCC $ \finish ->
                withReaderT (\rs -> rs { rsDone = ExitMonadFunction finish }) (runReverseContext routes >> finish Nothing)
 
-reverseURI' :: (CraneApp app, ConEq (RoutesFor app), DeconstructRoute (RoutesFor app)) => RoutesFor app -> CraneMonad app (Maybe T.Text)
-reverseURI' route = reversedURI <$> (routes <$> asks crApp)
-                                <*> pure route
+masterRoutes :: (CraneApp master, ActionContext ac pc, Arrow (pc master master), ArrowChoice (pc master master)) =>
+                ac master master (CraneHandler master master, AfterResponseActions master master) -> ac master master (CraneHandler master master, AfterResponseActions master master)
+masterRoutes = id
+
+reverseURI' :: ( CraneApp master, CraneApp app ) => RoutesFor app -> CraneMonad app master (Maybe T.Text)
+reverseURI' route = reversedURI <$> (masterRoutes . routes <$> asks crMaster) -- We always reverse the route in the master's context
+                                <*> asks crMaster
+                                <*> (asks crAppRouteToMaster <*> pure route) -- which means we have to convert the local route into a master route
 
 -- | An unsafe version of reverseURI' that can be used safely so long as the routing structure for `app` is total (contains all `RoutesFor app` constructors).
 --   If you're interested in total safety, use `reverseURI'`
-reverseURI :: (CraneApp app, ConEq (RoutesFor app), DeconstructRoute (RoutesFor app)) => RoutesFor app -> CraneMonad app T.Text
+reverseURI :: (CraneApp master, CraneApp app) => RoutesFor app -> CraneMonad app master T.Text
 reverseURI route = fromJust <$> reverseURI' route
 
 -- * Path Components
